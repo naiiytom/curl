@@ -197,6 +197,7 @@ static const struct LongShort aliases[]= {
   {"$Y", "suppress-connect-headers", ARG_BOOL},
   {"$Z", "compressed-ssh",           ARG_BOOL},
   {"$~", "happy-eyeballs-timeout-ms", ARG_STRING},
+  {"$!", "retry-all-errors",         ARG_BOOL},
   {"0",   "http1.0",                 ARG_NONE},
   {"01",  "http1.1",                 ARG_NONE},
   {"02",  "http2",                   ARG_NONE},
@@ -249,6 +250,7 @@ static const struct LongShort aliases[]= {
   {"Eq", "cert-status",              ARG_BOOL},
   {"Er", "false-start",              ARG_BOOL},
   {"Es", "ssl-no-revoke",            ARG_BOOL},
+  {"ES", "ssl-revoke-best-effort",   ARG_BOOL},
   {"Et", "tcp-fastopen",             ARG_BOOL},
   {"Eu", "proxy-tlsuser",            ARG_STRING},
   {"Ev", "proxy-tlspassword",        ARG_STRING},
@@ -273,6 +275,7 @@ static const struct LongShort aliases[]= {
   {"f",  "fail",                     ARG_BOOL},
   {"fa", "fail-early",               ARG_BOOL},
   {"fb", "styled-output",            ARG_BOOL},
+  {"fc", "mail-rcpt-allowfails",     ARG_BOOL},
   {"F",  "form",                     ARG_STRING},
   {"Fs", "form-string",              ARG_STRING},
   {"g",  "globoff",                  ARG_BOOL},
@@ -421,7 +424,7 @@ void parse_cert_parameter(const char *cert_parameter,
       /* escaped colons and Windows drive letter colons were handled
        * above; if we're still here, this is a separating colon */
       param_place++;
-      if(strlen(param_place) > 0) {
+      if(*param_place) {
         *passphrase = strdup(param_place);
       }
       goto done;
@@ -925,6 +928,9 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
         if(err)
           return err;
         break;
+      case '!': /* --retry-all-errors */
+        config->retry_all_errors = toggle;
+        break;
 
       case 'k': /* --proxy-negotiate */
         if(curlinfo->features & CURL_VERSION_SPNEGO)
@@ -1277,7 +1283,10 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
     case 'b':
       switch(subletter) {
       case 'a': /* --alt-svc */
-        GetStr(&config->altsvc, nextarg);
+        if(curlinfo->features & CURL_VERSION_ALTSVC)
+          GetStr(&config->altsvc, nextarg);
+        else
+          return PARAM_LIBCURL_DOESNT_SUPPORT;
         break;
       default:  /* --cookie string coming up: */
         if(nextarg[0] == '@') {
@@ -1602,6 +1611,11 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
           config->ssl_no_revoke = TRUE;
         break;
 
+      case 'S': /* --ssl-revoke-best-effort */
+        if(curlinfo->features & CURL_VERSION_SSL)
+          config->ssl_revoke_best_effort = TRUE;
+        break;
+
       case 't': /* --tcp-fastopen */
         config->tcp_fastopen = TRUE;
         break;
@@ -1721,6 +1735,9 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
         break;
       case 'b': /* --styled-output */
         global->styled_output = toggle;
+        break;
+      case 'c': /* --mail-rcpt-allowfails */
+        config->mail_rcpt_allowfails = toggle;
         break;
       default: /* --fail (hard on errors)  */
         config->failonerror = toggle;
@@ -2231,20 +2248,23 @@ ParameterError parse_args(struct GlobalConfig *global, int argc,
   struct OperationConfig *config = global->first;
 
   for(i = 1, stillflags = TRUE; i < argc && !result; i++) {
-    orig_opt = argv[i];
+    orig_opt = curlx_convert_tchar_to_UTF8(argv[i]);
 
-    if(stillflags && ('-' == argv[i][0])) {
+    if(stillflags && ('-' == orig_opt[0])) {
       bool passarg;
-      char *flag = argv[i];
 
-      if(!strcmp("--", argv[i]))
+      if(!strcmp("--", orig_opt))
         /* This indicates the end of the flags and thus enables the
            following (URL) argument to start with -. */
         stillflags = FALSE;
       else {
-        char *nextarg = (i < (argc - 1)) ? argv[i + 1] : NULL;
+        char *nextarg = (i < (argc - 1))
+          ? curlx_convert_tchar_to_UTF8(argv[i + 1])
+          : NULL;
 
-        result = getparameter(flag, nextarg, &passarg, global, config);
+        result = getparameter(orig_opt, nextarg, &passarg, global, config);
+        curlx_unicodefree(nextarg);
+        config = global->last;
         if(result == PARAM_NEXT_OPERATION) {
           /* Reset result as PARAM_NEXT_OPERATION is only used here and not
              returned from this function */
@@ -2279,7 +2299,7 @@ ParameterError parse_args(struct GlobalConfig *global, int argc,
       bool used;
 
       /* Just add the URL please */
-      result = getparameter((char *)"--url", argv[i], &used, global,
+      result = getparameter("--url", orig_opt, &used, global,
                             config);
     }
   }
@@ -2296,5 +2316,6 @@ ParameterError parse_args(struct GlobalConfig *global, int argc,
       helpf(global->errors, "%s\n", reason);
   }
 
+  curlx_unicodefree(orig_opt);
   return result;
 }

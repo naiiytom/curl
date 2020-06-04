@@ -87,7 +87,8 @@
 
 struct ResolverResults {
   int num_pending; /* number of ares_gethostbyname() requests */
-  Curl_addrinfo *temp_ai; /* intermediary result while fetching c-ares parts */
+  struct Curl_addrinfo *temp_ai; /* intermediary result while fetching c-ares
+                                    parts */
   int last_status;
   struct curltime happy_eyeballs_dns_time; /* when this timer started, or 0 */
 };
@@ -352,8 +353,8 @@ CURLcode Curl_resolver_is_resolved(struct connectdata *conn,
     conn->async.os_specific;
   CURLcode result = CURLE_OK;
 
-  if(dns)
-    *dns = NULL;
+  DEBUGASSERT(dns);
+  *dns = NULL;
 
   waitperform(conn, 0);
 
@@ -381,19 +382,18 @@ CURLcode Curl_resolver_is_resolved(struct connectdata *conn,
   }
 
   if(res && !res->num_pending) {
-    if(dns) {
-      (void)Curl_addrinfo_callback(conn, res->last_status, res->temp_ai);
-      /* temp_ai ownership is moved to the connection, so we need not free-up
-         them */
-      res->temp_ai = NULL;
-    }
+    (void)Curl_addrinfo_callback(conn, res->last_status, res->temp_ai);
+    /* temp_ai ownership is moved to the connection, so we need not free-up
+       them */
+    res->temp_ai = NULL;
+
     if(!conn->async.dns) {
       failf(data, "Could not resolve: %s (%s)",
             conn->async.hostname, ares_strerror(conn->async.status));
       result = conn->bits.proxy?CURLE_COULDNT_RESOLVE_PROXY:
         CURLE_COULDNT_RESOLVE_HOST;
     }
-    else if(dns)
+    else
       *dns = conn->async.dns;
 
     destroy_async_data(&conn->async);
@@ -408,7 +408,7 @@ CURLcode Curl_resolver_is_resolved(struct connectdata *conn,
  * Waits for a resolve to finish. This function should be avoided since using
  * this risk getting the multi interface to "hang".
  *
- * If 'entry' is non-NULL, make it point to the resolved dns entry
+ * 'entry' MUST be non-NULL.
  *
  * Returns CURLE_COULDNT_RESOLVE_HOST if the host was not resolved,
  * CURLE_OPERATION_TIMEDOUT if a time-out occurred, or other errors.
@@ -420,10 +420,9 @@ CURLcode Curl_resolver_wait_resolv(struct connectdata *conn,
   struct Curl_easy *data = conn->data;
   timediff_t timeout;
   struct curltime now = Curl_now();
-  struct Curl_dns_entry *temp_entry;
 
-  if(entry)
-    *entry = NULL; /* clear on entry */
+  DEBUGASSERT(entry);
+  *entry = NULL; /* clear on entry */
 
   timeout = Curl_timeleft(data, &now, TRUE);
   if(timeout < 0) {
@@ -456,7 +455,7 @@ CURLcode Curl_resolver_wait_resolv(struct connectdata *conn,
       timeout_ms = 1000;
 
     waitperform(conn, timeout_ms);
-    result = Curl_resolver_is_resolved(conn, entry?&temp_entry:NULL);
+    result = Curl_resolver_is_resolved(conn, entry);
 
     if(result || conn->async.done)
       break;
@@ -496,9 +495,9 @@ CURLcode Curl_resolver_wait_resolv(struct connectdata *conn,
 
 /* Connects results to the list */
 static void compound_results(struct ResolverResults *res,
-                             Curl_addrinfo *ai)
+                             struct Curl_addrinfo *ai)
 {
-  Curl_addrinfo *ai_tail;
+  struct Curl_addrinfo *ai_tail;
   if(!ai)
     return;
   ai_tail = ai;
@@ -540,7 +539,7 @@ static void query_completed_cb(void *arg,  /* (struct connectdata *) */
     res->num_pending--;
 
     if(CURL_ASYNC_SUCCESS == status) {
-      Curl_addrinfo *ai = Curl_he2ai(hostent, conn->async.port);
+      struct Curl_addrinfo *ai = Curl_he2ai(hostent, conn->async.port);
       if(ai) {
         compound_results(res, ai);
       }
@@ -619,10 +618,10 @@ static void query_completed_cb(void *arg,  /* (struct connectdata *) */
  * memory we need to free after use. That memory *MUST* be freed with
  * Curl_freeaddrinfo(), nothing else.
  */
-Curl_addrinfo *Curl_resolver_getaddrinfo(struct connectdata *conn,
-                                         const char *hostname,
-                                         int port,
-                                         int *waitp)
+struct Curl_addrinfo *Curl_resolver_getaddrinfo(struct connectdata *conn,
+                                                const char *hostname,
+                                                int port,
+                                                int *waitp)
 {
   char *bufp;
   struct Curl_easy *data = conn->data;
@@ -669,7 +668,7 @@ Curl_addrinfo *Curl_resolver_getaddrinfo(struct connectdata *conn,
     res->last_status = ARES_ENOTFOUND;
 #ifdef ENABLE_IPV6 /* CURLRES_IPV6 */
     if(family == PF_UNSPEC) {
-      if(Curl_ipv6works()) {
+      if(Curl_ipv6works(conn)) {
         res->num_pending = 2;
 
         /* areschannel is already setup in the Curl_open() function */

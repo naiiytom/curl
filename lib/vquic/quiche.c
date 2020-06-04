@@ -5,7 +5,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2019, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) 1998 - 2020, Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -34,6 +34,7 @@
 #include "multiif.h"
 #include "connect.h"
 #include "strerror.h"
+#include "vquic.h"
 
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
@@ -64,7 +65,6 @@ static CURLcode http_request(struct connectdata *conn, const void *mem,
 static Curl_recv h3_stream_recv;
 static Curl_send h3_stream_send;
 
-
 static int quiche_getsock(struct connectdata *conn, curl_socket_t *socks)
 {
   struct SingleRequest *k = &conn->data->req;
@@ -89,18 +89,24 @@ static int quiche_perform_getsock(const struct connectdata *conn,
   return quiche_getsock((struct connectdata *)conn, socks);
 }
 
-static CURLcode quiche_disconnect(struct connectdata *conn,
-                                  bool dead_connection)
+static CURLcode qs_disconnect(struct quicsocket *qs)
 {
-  struct quicsocket *qs = conn->quic;
-  (void)dead_connection;
-  quiche_h3_config_free(qs->h3config);
-  quiche_h3_conn_free(qs->h3c);
+  if(qs->h3config)
+    quiche_h3_config_free(qs->h3config);
+  if(qs->h3c)
+    quiche_h3_conn_free(qs->h3c);
   quiche_config_free(qs->cfg);
   quiche_conn_free(qs->conn);
   return CURLE_OK;
 }
 
+static CURLcode quiche_disconnect(struct connectdata *conn,
+                                  bool dead_connection)
+{
+  struct quicsocket *qs = conn->quic;
+  (void)dead_connection;
+  return qs_disconnect(qs);
+}
 static unsigned int quiche_conncheck(struct connectdata *conn,
                                      unsigned int checks_to_perform)
 {
@@ -171,7 +177,7 @@ CURLcode Curl_quic_connect(struct connectdata *conn, curl_socket_t sockfd,
     return CURLE_FAILED_INIT;
   }
 
-  quiche_config_set_idle_timeout(qs->cfg, QUIC_IDLE_TIMEOUT);
+  quiche_config_set_max_idle_timeout(qs->cfg, QUIC_IDLE_TIMEOUT);
   quiche_config_set_initial_max_data(qs->cfg, QUIC_MAX_DATA);
   quiche_config_set_initial_max_stream_data_bidi_local(qs->cfg, QUIC_MAX_DATA);
   quiche_config_set_initial_max_stream_data_bidi_remote(qs->cfg,
@@ -198,6 +204,17 @@ CURLcode Curl_quic_connect(struct connectdata *conn, curl_socket_t sockfd,
     failf(data, "can't create quiche connection");
     return CURLE_OUT_OF_MEMORY;
   }
+
+  /* Known to not work on Windows */
+#if !defined(WIN32) && defined(HAVE_QUICHE_CONN_SET_QLOG_FD)
+  {
+    int qfd;
+    (void)Curl_qlogdir(data, qs->scid, sizeof(qs->scid), &qfd);
+    if(qfd != -1)
+      quiche_conn_set_qlog_fd(qs->conn, qfd,
+                              "qlog title", "curl qlog");
+  }
+#endif
 
   result = flush_egress(conn, sockfd, qs);
   if(result)
@@ -273,11 +290,11 @@ CURLcode Curl_quic_is_connected(struct connectdata *conn, int sockindex,
 
   result = process_ingress(conn, sockfd, qs);
   if(result)
-    return result;
+    goto error;
 
   result = flush_egress(conn, sockfd, qs);
   if(result)
-    return result;
+    goto error;
 
   if(quiche_conn_is_established(qs->conn)) {
     *done = TRUE;
@@ -285,6 +302,9 @@ CURLcode Curl_quic_is_connected(struct connectdata *conn, int sockindex,
     DEBUGF(infof(conn->data, "quiche established connection!\n"));
   }
 
+  return result;
+  error:
+  qs_disconnect(qs);
   return result;
 }
 
@@ -532,7 +552,7 @@ static ssize_t h3_stream_send(struct connectdata *conn,
  */
 int Curl_quic_ver(char *p, size_t len)
 {
-  return msnprintf(p, len, " quiche/%s", quiche_version());
+  return msnprintf(p, len, "quiche/%s", quiche_version());
 }
 
 /* Index where :authority header field will appear in request header
@@ -714,7 +734,7 @@ static CURLcode http_request(struct connectdata *conn, const void *mem,
     }
   }
 
-  switch(data->set.httpreq) {
+  switch(data->state.httpreq) {
   case HTTPREQ_POST:
   case HTTPREQ_POST_FORM:
   case HTTPREQ_POST_MIME:
